@@ -22,6 +22,7 @@ fn main() {
   println!("cargo:rerun-if-changed=.gn");
   println!("cargo:rerun-if-changed=BUILD.gn");
   println!("cargo:rerun-if-changed=src/binding.cc");
+  println!("cargo:rerun-if-changed=src/locker.cc");
 
   // These are all the environment variables that we check. This is
   // probably more than what is needed, but missing an important
@@ -75,6 +76,7 @@ fn main() {
   }
 
   print_link_flags();
+  build_support_shims();
 
   // Don't attempt rebuild but link
   if is_trybuild {
@@ -121,6 +123,15 @@ fn main() {
   print_prebuilt_src_binding_path();
 
   download_static_lib_binaries();
+}
+
+fn build_support_shims() {
+  cc::Build::new()
+    .cpp(true)
+    .file("src/locker.cc")
+    .include("src/v8_headers")
+    .flag_if_supported("-std=c++20")
+    .compile("rusty_v8_support_shims");
 }
 
 fn acquire_lock() -> LockFile {

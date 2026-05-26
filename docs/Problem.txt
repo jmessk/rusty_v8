@@ -1,0 +1,82 @@
+We have a Rust project using rusty_v8 to run Cloudflare-style persistent tenant replicas.
+
+Goal:
+- Keep a tenant's V8 isolate/context resident across requests
+- Allow that persistent replica to move between threads using explicit isolate exit/enter
+- Run on a shared multi-thread Tokio runtime instead of pinning each tenant to a dedicated OS thread
+
+Current architecture in co-serverless:
+- Each tenant has one or more replicas.
+- Each replica owns:
+  - v8::OwnedIsolate
+  - v8::Global<v8::Context>
+  - per-request promise/resolver state
+- The replica is wrapped in a SharedReplica object with:
+  - an unbounded mailbox
+  - a load tracker
+  - a Mutex<Option<CfIsolateReplica>>
+  - a scheduled flag
+- Sending a mailbox command triggers scheduling of a short-lived Tokio task.
+- That task:
+  1. takes ownership of the replica from the Mutex
+  2. calls isolate.enter()
+  3. processes one or more mailbox commands
+  4. calls isolate.exit()
+  5. stores the replica back
+- The next mailbox turn may run on a different Tokio worker thread.
+
+Important details:
+- We already stopped storing a persistent Global<Function>.
+- Instead, on isolate creation we evaluate the module once and store the default export on globalThis.__cfFetch.
+- For each request we reopen the current context, look up globalThis.__cfFetch, and call it.
+- Snapshot + code cache are used on startup.
+
+Observed failure:
+- Intermittent SIGSEGV when a persistent replica is reused on a different thread for a later request.
+- Not just yield/resume; cross-request migration alone is enough.
+- Repro command:
+  cargo test --lib persistent_migrate_dispatcher_preserves_global_state --features v8-runtime -- --nocapture
+- Repeating that test 10 times gives about 7/10 SIGSEGV in our environment.
+- Existing fixed-thread persistent dispatchers do NOT crash:
+  cargo test thread_dispatcher_runs_persistent_replicas --features v8-runtime -- --nocapture
+
+What we observed during temporary instrumentation:
+- Request 1 succeeds on thread A
+- The same persistent replica is exited, stored, then later resumed for request 2 on thread B
+- The crash happens during the second top-level fetch.call(...) on thread B
+
+This strongly suggests:
+- Moving an exited persistent isolate/context bundle between threads is not reliably safe for repeated top-level function calls
+- The failure is not limited to Promise resume after async I/O
+- The unsafe edge seems to be: enter on thread A -> call JS -> exit -> move -> enter on thread B -> call JS again
+
+What I want from the rusty_v8 fork:
+1. Build a minimal rusty_v8-only reproduction independent of Tokio/hyper.
+2. Reproduce this pattern:
+   - create isolate + context
+   - evaluate module / obtain callable function through the context
+   - call function on thread A
+   - exit isolate
+   - move OwnedIsolate + Global<Context> to thread B
+   - enter isolate
+   - call function again
+3. Investigate whether this is:
+   - a rusty_v8 wrapper bug
+   - missing Locker / thread-entry handling
+   - invalid persistent handle reopening across threads
+   - V8 embedder contract violation we are currently relying on incorrectly
+4. If fixable in rusty_v8, patch the fork and keep the repro as a test or standalone example.
+
+Files in our repo that show the current design:
+- src/dispatcher/v8_cf_migrate_persistent.rs
+- src/runtime/v8/cf/mod.rs
+- src/runtime/v8/cf/io.rs
+- src/runtime/v8/cf/placement.rs
+
+Reference experiment that originally suggested migration could work:
+- isolate-migration/README.md
+- isolate-migration/main.rs
+
+One important nuance:
+- The isolate-migration experiment proved that suspend -> exit -> move -> enter -> resolve promise can work in some cases.
+- Our current crash happens with a persistent replica reused across requests, which appears to be a harder case.

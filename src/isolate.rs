@@ -943,6 +943,18 @@ impl Isolate {
     OwnedIsolate::new(Self::new_impl(params))
   }
 
+  /// Creates a new isolate in an exited state so it can be handed to another
+  /// thread before first entry.
+  ///
+  /// The returned wrapper is `Send`, but using it across threads is still
+  /// unsafe at the API level: re-entry must follow V8's locking contract, and
+  /// the isolate must be re-entered on its final thread before disposal.
+  #[allow(clippy::new_ret_no_self)]
+  pub fn new_sendable(params: CreateParams) -> crate::SendableOwnedIsolate {
+    let isolate = OwnedIsolate::new_already_entered(Self::new_impl(params));
+    unsafe { crate::SendableOwnedIsolate::new(isolate) }
+  }
+
   #[allow(clippy::new_ret_no_self)]
   pub fn snapshot_creator(
     external_references: Option<Cow<'static, [ExternalReference]>>,

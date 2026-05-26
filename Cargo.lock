@@ -1765,6 +1765,7 @@ dependencies = [
  "bindgen",
  "bitflags 2.9.3",
  "bytes",
+ "cc",
  "fslock",
  "gzip-header",
  "home",

@@ -50,6 +50,7 @@ mod handle;
 pub mod icu;
 mod isolate;
 mod isolate_create_params;
+mod locker;
 mod microtask;
 mod module;
 mod name;
@@ -69,6 +70,7 @@ mod regexp;
 mod scope;
 mod script;
 mod script_or_module;
+mod sendable;
 mod shared_array_buffer;
 mod snapshot;
 mod string;
@@ -166,11 +168,14 @@ pub use scope::PinnedRef;
 pub use scope::ScopeStorage;
 // pub use scope::HandleScope;
 pub use isolate::UnsafeRawIsolatePtr;
+pub use locker::Locker;
 pub use scope::HandleScope;
 pub use scope::OnFailure;
 pub use scope::TryCatch;
 pub use script::ScriptOrigin;
 pub use script_compiler::CachedData;
+pub use sendable::SendableGlobal;
+pub use sendable::SendableOwnedIsolate;
 pub use snapshot::FunctionCodeHandling;
 pub use snapshot::StartupData;
 pub use string::Encoding;
@@ -229,4 +234,244 @@ pub(crate) fn initialize_v8() {
     V8::initialize_platform(new_default_platform(0, false).make_shared());
     V8::initialize();
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::sync::Once;
+
+  fn initialize_v8_unprotected() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+      V8::initialize_platform(
+        new_unprotected_default_platform(0, false).make_shared(),
+      );
+      V8::initialize();
+    });
+  }
+
+  fn increment_counter(
+    isolate: &mut OwnedIsolate,
+    context: &Global<Context>,
+  ) -> i32 {
+    let scope = std::pin::pin!(HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = Local::new(scope, context);
+    let scope = &mut ContextScope::new(scope, context);
+    let source = String::new(
+      scope,
+      "globalThis.counter = (globalThis.counter ?? 0) + 1; globalThis.counter",
+    )
+    .unwrap();
+    let script = Script::compile(scope, source, None).unwrap();
+    let value = script.run(scope).unwrap();
+    value.int32_value(scope).unwrap()
+  }
+
+  fn run_fresh_context_script(isolate: &mut OwnedIsolate, source: &str) -> i32 {
+    let scope = std::pin::pin!(HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = Context::new(scope, Default::default());
+    let scope = &mut ContextScope::new(scope, context);
+    let source = String::new(scope, source).unwrap();
+    let script = Script::compile(scope, source, None).unwrap();
+    let value = script.run(scope).unwrap();
+    value.int32_value(scope).unwrap()
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[test]
+  fn isolate_can_call_js_with_locker_same_thread() {
+    initialize_v8();
+
+    let mut isolate = Isolate::new_sendable(Default::default()).into_inner();
+    let _locker = Locker::new(&isolate);
+    unsafe { isolate.enter() };
+    assert_eq!(run_fresh_context_script(&mut isolate, "1 + 1"), 2);
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[ignore = "documents the current failure mode without Locker"]
+  #[test]
+  fn isolate_cannot_migrate_threads_with_fresh_contexts_without_locker() {
+    initialize_v8_unprotected();
+
+    let mut isolate = Isolate::new(Default::default());
+    assert_eq!(run_fresh_context_script(&mut isolate, "1 + 1"), 2);
+    unsafe { isolate.exit() };
+
+    let isolate = unsafe { SendableOwnedIsolate::new(isolate) };
+    let handle = std::thread::spawn(move || {
+      let mut isolate = isolate.into_inner();
+      unsafe { isolate.enter() };
+      let value = run_fresh_context_script(&mut isolate, "2 + 2");
+      unsafe { isolate.exit() };
+      (unsafe { SendableOwnedIsolate::new(isolate) }, value)
+    });
+
+    let (isolate, value) = handle.join().unwrap();
+    assert_eq!(value, 4);
+
+    let mut isolate = isolate.into_inner();
+    unsafe { isolate.enter() };
+    assert_eq!(run_fresh_context_script(&mut isolate, "3 + 3"), 6);
+    drop(isolate);
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[ignore = "documents the current failure mode without Locker"]
+  #[test]
+  fn isolate_cannot_migrate_threads_and_call_js_without_locker() {
+    initialize_v8_unprotected();
+
+    let mut isolate = Isolate::new(Default::default());
+    let context = {
+      let scope = std::pin::pin!(HandleScope::new(&mut isolate));
+      let scope = &mut scope.init();
+      let context = Context::new(scope, Default::default());
+      Global::new(scope, context)
+    };
+
+    let mut current = increment_counter(&mut isolate, &context);
+    assert_eq!(current, 1);
+    unsafe { isolate.exit() };
+
+    let mut isolate = unsafe { SendableOwnedIsolate::new(isolate) };
+    let mut context = unsafe { SendableGlobal::new(context) };
+
+    for _ in 0..10 {
+      let handle = std::thread::spawn(move || {
+        let mut isolate = isolate.into_inner();
+        let context = context.into_inner();
+        unsafe { isolate.enter() };
+        let current = increment_counter(&mut isolate, &context);
+        unsafe { isolate.exit() };
+        (
+          unsafe { SendableOwnedIsolate::new(isolate) },
+          unsafe { SendableGlobal::new(context) },
+          current,
+        )
+      });
+
+      let (returned_isolate, returned_context, worker_current) =
+        handle.join().unwrap();
+      isolate = returned_isolate;
+      context = returned_context;
+
+      current += 1;
+      assert_eq!(worker_current, current);
+
+      let mut main_isolate = isolate.into_inner();
+      let main_context = context.into_inner();
+      unsafe { main_isolate.enter() };
+      current = increment_counter(&mut main_isolate, &main_context);
+      unsafe { main_isolate.exit() };
+      isolate = unsafe { SendableOwnedIsolate::new(main_isolate) };
+      context = unsafe { SendableGlobal::new(main_context) };
+    }
+
+    let mut isolate = isolate.into_inner();
+    let context = context.into_inner();
+    unsafe { isolate.enter() };
+    assert_eq!(increment_counter(&mut isolate, &context), current + 1);
+    drop(context);
+    drop(isolate);
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[test]
+  fn isolate_can_migrate_threads_with_fresh_contexts_and_locker() {
+    initialize_v8();
+
+    let mut isolate = Isolate::new_sendable(Default::default()).into_inner();
+    let locker = Locker::new(&isolate);
+    unsafe { isolate.enter() };
+    assert_eq!(run_fresh_context_script(&mut isolate, "1 + 1"), 2);
+    unsafe { isolate.exit() };
+    drop(locker);
+
+    let isolate = unsafe { SendableOwnedIsolate::new(isolate) };
+    let handle = std::thread::spawn(move || {
+      let mut isolate = isolate.into_inner();
+      let locker = Locker::new(&isolate);
+      unsafe { isolate.enter() };
+      let value = run_fresh_context_script(&mut isolate, "2 + 2");
+      unsafe { isolate.exit() };
+      drop(locker);
+      (unsafe { SendableOwnedIsolate::new(isolate) }, value)
+    });
+
+    let (isolate, value) = handle.join().unwrap();
+    assert_eq!(value, 4);
+    let mut isolate = isolate.into_inner();
+    let _locker = Locker::new(&isolate);
+    unsafe { isolate.enter() };
+    assert_eq!(run_fresh_context_script(&mut isolate, "3 + 3"), 6);
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[test]
+  fn isolate_can_migrate_threads_and_call_js_with_persistent_context_and_locker()
+   {
+    initialize_v8();
+
+    let mut isolate = Isolate::new_sendable(Default::default()).into_inner();
+    let locker = Locker::new(&isolate);
+    unsafe { isolate.enter() };
+    let context = {
+      let scope = std::pin::pin!(HandleScope::new(&mut isolate));
+      let scope = &mut scope.init();
+      let context = Context::new(scope, Default::default());
+      Global::new(scope, context)
+    };
+
+    let mut current = increment_counter(&mut isolate, &context);
+    assert_eq!(current, 1);
+    unsafe { isolate.exit() };
+    drop(locker);
+
+    let mut isolate = unsafe { SendableOwnedIsolate::new(isolate) };
+    let mut context = unsafe { SendableGlobal::new(context) };
+
+    for _ in 0..10 {
+      let handle = std::thread::spawn(move || {
+        let mut isolate = isolate.into_inner();
+        let context = context.into_inner();
+        let locker = Locker::new(&isolate);
+        unsafe { isolate.enter() };
+        let current = increment_counter(&mut isolate, &context);
+        unsafe { isolate.exit() };
+        drop(locker);
+        (
+          unsafe { SendableOwnedIsolate::new(isolate) },
+          unsafe { SendableGlobal::new(context) },
+          current,
+        )
+      });
+
+      let (returned_isolate, returned_context, worker_current) =
+        handle.join().unwrap();
+      isolate = returned_isolate;
+      context = returned_context;
+
+      current += 1;
+      assert_eq!(worker_current, current);
+
+      let mut main_isolate = isolate.into_inner();
+      let main_context = context.into_inner();
+      let locker = Locker::new(&main_isolate);
+      unsafe { main_isolate.enter() };
+      current = increment_counter(&mut main_isolate, &main_context);
+      unsafe { main_isolate.exit() };
+      drop(locker);
+      isolate = unsafe { SendableOwnedIsolate::new(main_isolate) };
+      context = unsafe { SendableGlobal::new(main_context) };
+    }
+    let mut isolate = isolate.into_inner();
+    let context = context.into_inner();
+    let _locker = Locker::new(&isolate);
+    unsafe { isolate.enter() };
+    assert_eq!(increment_counter(&mut isolate, &context), current + 1);
+  }
 }
