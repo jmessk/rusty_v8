@@ -585,6 +585,36 @@ fn prebuilt_features_suffix() -> String {
   features
 }
 
+fn prebuilt_asset_base_url() -> String {
+  let default_base = "https://github.com/denoland/rusty_v8/releases/download";
+  env::var("RUSTY_V8_MIRROR").unwrap_or_else(|_| default_base.into())
+}
+
+fn prebuilt_asset_url(name: &str) -> String {
+  let base = prebuilt_asset_base_url();
+  let version = env::var("CARGO_PKG_VERSION").unwrap();
+  format!("{base}/v{version}/{name}")
+}
+
+fn prebuilt_binding_name_for(
+  target: &str,
+  profile: &str,
+  features: &str,
+) -> String {
+  format!("src_binding{features}_{profile}_{target}.rs")
+}
+
+fn prebuilt_binding_name() -> String {
+  let target = env::var("TARGET").unwrap();
+  let profile = prebuilt_profile();
+  let features = prebuilt_features_suffix();
+  prebuilt_binding_name_for(&target, &profile, &features)
+}
+
+fn prebuilt_binding_url() -> String {
+  prebuilt_asset_url(&prebuilt_binding_name())
+}
+
 fn static_lib_name(suffix: &str) -> String {
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
   if target_os == "windows" {
@@ -598,17 +628,14 @@ fn static_lib_url() -> String {
   if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {
     return custom_archive;
   }
-  let default_base = "https://github.com/denoland/rusty_v8/releases/download";
-  let base =
-    env::var("RUSTY_V8_MIRROR").unwrap_or_else(|_| default_base.into());
-  let version = env::var("CARGO_PKG_VERSION").unwrap();
   let target = env::var("TARGET").unwrap();
   let profile = prebuilt_profile();
   let features = prebuilt_features_suffix();
-  format!(
-    "{base}/v{version}/{}.gz",
-    static_lib_name(&format!("{features}_{profile}_{target}")),
-  )
+  let name = format!(
+    "{}.gz",
+    static_lib_name(&format!("{features}_{profile}_{target}"))
+  );
+  prebuilt_asset_url(&name)
 }
 
 fn static_lib_path() -> PathBuf {
@@ -661,7 +688,7 @@ fn download_file(url: &str, filename: &Path) {
 
   // Checksum (i.e: url) to avoid re-downloads
   match fs::read_to_string(static_checksum_path(filename)) {
-    Ok(c) if c == static_lib_url() => return,
+    Ok(c) if c == url => return,
     _ => {}
   };
 
@@ -895,18 +922,16 @@ fn print_prebuilt_src_binding_path() {
     return;
   }
 
-  let target = env::var("TARGET").unwrap();
-  let profile = prebuilt_profile();
-  let features = prebuilt_features_suffix();
-  let name = format!("src_binding{features}_{profile}_{target}.rs");
-
-  let src_binding_path = get_dirs().root.join("gen").join(name.clone());
-
-  if let Ok(base) = env::var("RUSTY_V8_MIRROR") {
-    let version = env::var("CARGO_PKG_VERSION").unwrap();
-    let url = format!("{base}/v{version}/{name}");
-    download_file(&url, &src_binding_path);
-  }
+  let name = prebuilt_binding_name();
+  let checked_in_path = get_dirs().root.join("gen").join(&name);
+  let src_binding_path =
+    if env::var("RUSTY_V8_MIRROR").is_ok() || !checked_in_path.exists() {
+      let downloaded_path = build_dir().join(name);
+      download_file(&prebuilt_binding_url(), &downloaded_path);
+      downloaded_path
+    } else {
+      checked_in_path
+    };
 
   println!(
     "cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={}",
@@ -1305,5 +1330,13 @@ edge [fontsize=10]
     assert!(files.contains("../../../example/src/input.txt"));
     assert!(files.contains("../../../example/src/count_bytes.py"));
     assert!(!files.contains("obj/hello/hello.o"));
+  }
+
+  #[test]
+  fn test_prebuilt_binding_name_for_aarch64_linux_release() {
+    assert_eq!(
+      prebuilt_binding_name_for("aarch64-unknown-linux-gnu", "release", "",),
+      "src_binding_release_aarch64-unknown-linux-gnu.rs",
+    );
   }
 }
