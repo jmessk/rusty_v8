@@ -412,6 +412,22 @@ void v8__Isolate__RequestGarbageCollectionForTesting(
   isolate->RequestGarbageCollectionForTesting(type);
 }
 
+int v8__JitCodeEvent__GetEventType(const v8::JitCodeEvent* event) {
+  return event->type;
+}
+
+int v8__JitCodeEvent__GetCodeType(const v8::JitCodeEvent* event) {
+  return event->code_type;
+}
+
+void* v8__JitCodeEvent__GetCodeStart(const v8::JitCodeEvent* event) {
+  return event->code_start;
+}
+
+size_t v8__JitCodeEvent__GetCodeLen(const v8::JitCodeEvent* event) {
+  return event->code_len;
+}
+
 void v8__Isolate__CreateParams__CONSTRUCT(
     uninit_t<v8::Isolate::CreateParams>* buf) {
   construct_in_place<v8::Isolate::CreateParams>(buf);

@@ -10279,6 +10279,51 @@ fn counter_lookup_callback() {
   assert_ne!(count, 0);
 }
 
+#[test]
+fn jit_code_event_handler() {
+  static JIT_CODE_ADDED_EVENTS: AtomicUsize = AtomicUsize::new(0);
+  static SAW_VALID_JIT_CODE_EVENT: AtomicBool = AtomicBool::new(false);
+
+  unsafe extern "C" fn callback(event: &v8::JitCodeEvent) {
+    if event.event_type() == v8::JitCodeEventType::CodeAdded
+      && event.code_type() == v8::JitCodeCodeType::JitCode
+    {
+      JIT_CODE_ADDED_EVENTS.fetch_add(1, Ordering::Relaxed);
+      if !event.code_start().is_null() && event.code_len() > 0 {
+        SAW_VALID_JIT_CODE_EVENT.store(true, Ordering::Relaxed);
+      }
+    }
+  }
+
+  JIT_CODE_ADDED_EVENTS.store(0, Ordering::Relaxed);
+  SAW_VALID_JIT_CODE_EVENT.store(false, Ordering::Relaxed);
+
+  let _setup_guard = setup::parallel_test();
+  let params = v8::CreateParams::default().jit_code_event_handler(callback);
+  let isolate = &mut v8::Isolate::new(params);
+  v8::scope!(let scope, isolate);
+
+  let context = v8::Context::new(scope, Default::default());
+  let scope = &mut v8::ContextScope::new(scope, context);
+  eval(
+    scope,
+    r#"
+      function add(a, b) { return a + b; }
+      %PrepareFunctionForOptimization(add);
+      for (let i = 0; i < 10000; i++) add(i, i + 1);
+      %OptimizeFunctionOnNextCall(add);
+      add(1, 2);
+    "#,
+  )
+  .unwrap();
+
+  assert!(
+    JIT_CODE_ADDED_EVENTS.load(Ordering::Relaxed) > 0,
+    "expected at least one CODE_ADDED JIT_CODE event"
+  );
+  assert!(SAW_VALID_JIT_CODE_EVENT.load(Ordering::Relaxed));
+}
+
 #[cfg(not(target_os = "android"))]
 #[test]
 fn compiled_wasm_module() {

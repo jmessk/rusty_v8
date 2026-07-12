@@ -255,6 +255,31 @@ fn build_binding() {
   bindings
     .write_to_file(out_path)
     .expect("Couldn't write bindings!");
+  patch_generated_bindings();
+}
+
+fn patch_generated_bindings() {
+  let out_path = build_dir().join("gn_out").join("src_binding.rs");
+  let mut bindings =
+    fs::read_to_string(&out_path).expect("Couldn't read bindings!");
+
+  if bindings.contains("pub const WriteFlags_kNullTerminate")
+    && !bindings.contains("pub const v8_String_WriteFlags_kNullTerminate")
+  {
+    bindings.push_str(
+      "\npub const v8_String_WriteFlags_kNullTerminate: WriteFlags__bindgen_ty_1 = WriteFlags_kNullTerminate;\n",
+    );
+  }
+
+  if bindings.contains("pub const WriteFlags_kReplaceInvalidUtf8")
+    && !bindings.contains("pub const v8_String_WriteFlags_kReplaceInvalidUtf8")
+  {
+    bindings.push_str(
+      "pub const v8_String_WriteFlags_kReplaceInvalidUtf8: WriteFlags__bindgen_ty_1 = WriteFlags_kReplaceInvalidUtf8;\n",
+    );
+  }
+
+  fs::write(out_path, bindings).expect("Couldn't patch bindings!");
 }
 
 fn build_v8(is_asan: bool) {

@@ -12,6 +12,7 @@ use crate::support::intptr_t;
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::ffi::c_void;
 use std::iter::once;
 use std::mem::MaybeUninit;
 use std::mem::size_of;
@@ -22,6 +23,84 @@ use std::ptr::null;
 pub type CounterLookupCallback =
   unsafe extern "C" fn(name: *const char) -> *mut i32;
 
+/// The kind of JIT code event that V8 emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum JitCodeEventType {
+  CodeAdded = 0,
+  CodeMoved = 1,
+  CodeRemoved = 2,
+  CodeAddLinePosInfo = 3,
+  CodeStartLineInfoRecording = 4,
+  CodeEndLineInfoRecording = 5,
+}
+
+impl JitCodeEventType {
+  fn from_raw(value: i32) -> Self {
+    match value {
+      0 => Self::CodeAdded,
+      1 => Self::CodeMoved,
+      2 => Self::CodeRemoved,
+      3 => Self::CodeAddLinePosInfo,
+      4 => Self::CodeStartLineInfoRecording,
+      5 => Self::CodeEndLineInfoRecording,
+      _ => unreachable!("unexpected JIT code event type: {value}"),
+    }
+  }
+}
+
+/// The kind of code referenced by a JIT code event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum JitCodeCodeType {
+  ByteCode = 0,
+  JitCode = 1,
+  WasmCode = 2,
+}
+
+impl JitCodeCodeType {
+  fn from_raw(value: i32) -> Self {
+    match value {
+      0 => Self::ByteCode,
+      1 => Self::JitCode,
+      2 => Self::WasmCode,
+      _ => unreachable!("unexpected JIT code type: {value}"),
+    }
+  }
+}
+
+/// A JIT code event emitted by V8.
+#[repr(C)]
+pub struct JitCodeEvent(Opaque);
+
+impl JitCodeEvent {
+  /// Returns the kind of event V8 emitted.
+  pub fn event_type(&self) -> JitCodeEventType {
+    JitCodeEventType::from_raw(unsafe {
+      raw::v8__JitCodeEvent__GetEventType(self)
+    })
+  }
+
+  /// Returns the kind of code associated with this event.
+  pub fn code_type(&self) -> JitCodeCodeType {
+    JitCodeCodeType::from_raw(unsafe {
+      raw::v8__JitCodeEvent__GetCodeType(self)
+    })
+  }
+
+  /// Returns the start address of the generated code.
+  pub fn code_start(&self) -> *mut c_void {
+    unsafe { raw::v8__JitCodeEvent__GetCodeStart(self) }
+  }
+
+  /// Returns the size of the generated code in bytes.
+  pub fn code_len(&self) -> usize {
+    unsafe { raw::v8__JitCodeEvent__GetCodeLen(self) }
+  }
+}
+
+pub type JitCodeEventHandler = unsafe extern "C" fn(&JitCodeEvent);
+
 /// Initial configuration parameters for a new Isolate.
 #[must_use]
 #[derive(Debug, Default)]
@@ -31,6 +110,15 @@ pub struct CreateParams {
 }
 
 impl CreateParams {
+  /// Enables callbacks when V8 adds, moves, or removes code.
+  pub fn jit_code_event_handler(
+    mut self,
+    callback: JitCodeEventHandler,
+  ) -> Self {
+    self.raw.code_event_handler = callback as *const () as *const Opaque;
+    self
+  }
+
   /// Enables the host application to provide a mechanism for recording
   /// statistics counters.
   pub fn counter_lookup_callback(
@@ -332,6 +420,18 @@ pub(crate) mod raw {
   }
 
   unsafe extern "C" {
+    pub(crate) fn v8__JitCodeEvent__GetEventType(
+      event: *const JitCodeEvent,
+    ) -> i32;
+    pub(crate) fn v8__JitCodeEvent__GetCodeType(
+      event: *const JitCodeEvent,
+    ) -> i32;
+    pub(crate) fn v8__JitCodeEvent__GetCodeStart(
+      event: *const JitCodeEvent,
+    ) -> *mut c_void;
+    pub(crate) fn v8__JitCodeEvent__GetCodeLen(
+      event: *const JitCodeEvent,
+    ) -> usize;
     fn v8__Isolate__CreateParams__CONSTRUCT(
       buf: *mut MaybeUninit<CreateParams>,
     );

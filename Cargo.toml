@@ -133,6 +133,7 @@ which = "6"
 home = "0"
 rustversion = "1"
 bindgen = "0.72"
+cc = "1"
 
 [[example]]
 name = "hello_world"
